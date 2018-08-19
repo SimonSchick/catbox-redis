@@ -3,28 +3,21 @@
 
 // Load modules
 
-const Code = require('code');
+const { expect } = require('code');
 const Lab = require('lab');
 const Catbox = require('catbox');
-const { CatboxRedis: Redis, NotConnectedError } = require('..');
+const { CatboxRedis, NotConnectedError } = require('..');
 const RedisClient = require('ioredis');
-const EventEmitter = require('events').EventEmitter;
 
 
 // Declare internals
 
-const internals = {};
 
 
 // Test shortcuts
 
 const lab = exports.lab = Lab.script();
-const expect = Code.expect;
-const describe = lab.describe;
-const it = lab.test;
-const before = lab.before;
-const after = lab.after;
-
+const { describe, it } = lab;
 
 // Utils
 
@@ -49,13 +42,16 @@ const makeRedis = async (ropts) => {
     return cl;
 }
 
-const makeClient = async (opts, ropts) => new Catbox.Client(Redis, {
-    ...opts,
-    client: await makeRedis(ropts),
-});
+async function closeAndWait(redis) {
+    await redis.disconnect();
+    await timeoutPromise(25);
+}
+
+const makeClient = async (opts, ropts) => new Catbox.Client(await makeCBRedis(opts, ropts))
+
 
 const makeCBRedis = async (opts, ropts) =>
-    new Redis({
+    new CatboxRedis({
         ...opts,
         client: await makeRedis(ropts),
 });
@@ -66,15 +62,6 @@ describe('Redis', () => {
         const client = await makeClient();
         await client.start();
         expect(client.isReady()).to.equal(true);
-    });
-
-    it('closes the connection', async () => {
-
-        const client = await makeClient();
-        await client.start();
-        expect(client.isReady()).to.equal(true);
-        await client.stop();
-        expect(client.isReady()).to.equal(false);
     });
 
     it('allow passing client in option', async () => {
@@ -89,29 +76,14 @@ describe('Redis', () => {
             return _get.apply(redisClient, arguments);
         };
 
-        const client = new Catbox.Client(Redis, {
+        const client = new Catbox.Client(new CatboxRedis({
             client: redisClient
-        });
+        }));
         await client.start();
         expect(client.isReady()).to.equal(true);
         const key = { id: 'x', segment: 'test' };
         await client.get(key);
         expect(getCalled).to.equal(true);
-    });
-
-    it('does not stop provided client in options', async () => {
-
-        const redisClient = await makeRedis();
-
-        const client = new Catbox.Client(Redis, {
-            client: redisClient
-        });
-        await client.start();
-        expect(client.isReady()).to.equal(true);
-        await client.stop();
-        expect(client.isReady()).to.equal(false);
-        expect(redisClient.status).to.equal('ready');
-        await redisClient.quit();
     });
 
     it('gets an item after setting it', async () => {
@@ -240,33 +212,6 @@ describe('Redis', () => {
         await expect(client.drop(null)).to.reject(Error);
     });
 
-    it('returns error on get when stopped', async () => {
-
-        const client = await makeClient();
-        await client.stop();
-
-        const key = { id: 'x', segment: 'test' };
-        await expect(client.connection.get(key)).to.reject(NotConnectedError);
-    });
-
-    it('returns error on set when stopped', async () => {
-
-        const client = await makeClient();
-        await client.stop();
-
-        const key = { id: 'x', segment: 'test' };
-        await expect(client.connection.set(key, 'y', 1)).to.reject(NotConnectedError);
-    });
-
-    it('returns error on drop when stopped', async () => {
-
-        const client = await makeClient();
-        await client.stop();
-
-        const key = { id: 'x', segment: 'test' };
-        await expect(client.connection.drop(key)).to.reject(NotConnectedError);
-    });
-
     it('returns error on missing segment name', async () => {
         await expect((async () => {
             const client = await makeClient();
@@ -340,9 +285,8 @@ describe('Redis', () => {
             const redis = await makeCBRedis();
 
             await redis.start();
-            expect(redis.client).to.exist();
             expect(redis.isReady()).to.equal(true);
-            await redis.stop();
+            await closeAndWait(redis.client);
             expect(redis.isReady()).to.equal(false);
         });
     });
@@ -383,16 +327,17 @@ describe('Redis', () => {
 
         it('returns a promise that rejects when the connection is closed', async () => {
 
-            const redis = await makeClient();
-            await redis.stop();
+            const redis = await makeCBRedis();
+            await closeAndWait(redis.client);
 
             await expect(redis.get('test')).to.reject(NotConnectedError);
         });
 
         it('returns a promise that rejects when there is an error returned from getting an item', async () => {
 
-            const redis = await makeClient();
+            const redis = await makeCBRedis();
             redis.client = {
+                status: 'ready',
                 async get (item) { throw new Error(); }
             };
 
@@ -403,6 +348,7 @@ describe('Redis', () => {
 
             const redis = await makeCBRedis();
             redis.client = {
+                status: 'ready',
                 async get (item) { return 'test'; }
             };
 
@@ -413,6 +359,7 @@ describe('Redis', () => {
 
             const redis = await makeCBRedis();
             redis.client = {
+                status: 'ready',
                 async get (item) { return '{ "item": "false" }' },
             };
 
@@ -423,6 +370,7 @@ describe('Redis', () => {
 
             const redis = await makeCBRedis();
             redis.client = {
+                status: 'ready',
                 async get (item) { return '{ "stored": "123" }'; }
             };
 
@@ -482,7 +430,7 @@ describe('Redis', () => {
         it('returns a promise that rejects when the connection is closed', async () => {
 
             const redis = await makeCBRedis();
-            await redis.stop();
+            await closeAndWait(redis.client);
 
             await expect(redis.set('test1', 'test1', 3600)).to.reject(NotConnectedError);
         });
@@ -491,6 +439,7 @@ describe('Redis', () => {
 
             const redis = await makeCBRedis();
             redis.client = {
+                status: 'ready',
                 async set (key, item, callback) { throw new Error(); },
             };
 
@@ -501,17 +450,16 @@ describe('Redis', () => {
     describe('drop()', () => {
 
         it('returns a promise that rejects when the connection is closed', async () => {
-
             const redis = await makeCBRedis();
-
-            await redis.stop();
-            await expect( redis.drop('test2')).to.reject(NotConnectedError);
+            await closeAndWait(redis.client);
+            await expect(redis.drop('test2')).to.reject(NotConnectedError);
         });
 
         it('deletes the item from redis', async () => {
 
             const redis = await makeCBRedis();
             redis.client = {
+                status: 'ready',
                 async del (key) {
                     return null;
                 }
@@ -551,15 +499,5 @@ describe('Redis', () => {
     });
 
     describe('stop()', () => {
-
-        it('sets the client to null', async () => {
-
-            const redis = await makeCBRedis();
-
-            await redis.start();
-            expect(redis.client).to.exist();
-            await redis.stop();
-            expect(redis.client).to.not.exist();
-        });
     });
 });
